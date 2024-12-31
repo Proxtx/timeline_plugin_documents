@@ -9,7 +9,71 @@ use std::{path::Path, thread};
 #[derive(Debug)]
 enum Comparison {
     Identical,
-    Different(Vec<usize>),
+    Different(DifferenceSegments),
+}
+
+impl Comparison {
+    pub fn from_similarity(sim: &PageSimilarity, img_a: &RgbImage, img_b: &Vec<RgbImage>) -> Self {
+        match sim {
+            PageSimilarity::Different => Comparison::Different(DifferenceSegments {
+                segments: vec![(0., 1.)],
+            }),
+            PageSimilarity::Similar(index, _sim) => {
+                let img_b = img_b.get(*index).unwrap();
+                let difference_builder = DifferenceSegementsBuilder::build();
+                img_a.rows().zip(img_b.rows()).for_each(|(r_a, r_b)| r_a);
+            }
+        }
+    }
+}
+
+struct DifferenceSegementsBuilder {
+    segments: DifferenceSegments,
+    current_segment: Option<(f64, f64)>,
+}
+
+impl DifferenceSegementsBuilder {
+    pub fn build() -> Self {
+        DifferenceSegementsBuilder {
+            segments: DifferenceSegments {
+                segments: Vec::new(),
+            },
+            current_segment: None,
+        }
+    }
+
+    pub fn step(&mut self, position: f64, hit: bool) {
+        match &self.current_segment {
+            Some(v) => {
+                if hit {
+                    self.current_segment = Some((v.0, position));
+                } else {
+                    self.segments.segments.push(*v);
+                    self.current_segment = None;
+                }
+            }
+            None => {
+                if hit {
+                    self.current_segment = Some((position, position))
+                }
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> DifferenceSegments {
+        match self.current_segment {
+            Some(v) => {
+                self.segments.segments.push(v);
+                self.segments
+            }
+            None => self.segments,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DifferenceSegments {
+    pub segments: Vec<(f64, f64)>,
 }
 
 #[derive(Debug)]
