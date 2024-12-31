@@ -1,4 +1,4 @@
-use image::RgbImage;
+use image::{ImageBuffer, RgbImage};
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
@@ -13,15 +13,34 @@ enum Comparison {
 }
 
 impl Comparison {
-    pub fn from_similarity(sim: &PageSimilarity, img_a: &RgbImage, img_b: &Vec<RgbImage>) -> Self {
+    pub fn from_similarity(sim: &PageSimilarity, img_a: &RgbImage, img_b: &[RgbImage]) -> Self {
         match sim {
             PageSimilarity::Different => Comparison::Different(DifferenceSegments {
                 segments: vec![(0., 1.)],
             }),
-            PageSimilarity::Similar(index, _sim) => {
-                let img_b = img_b.get(*index).unwrap();
-                let difference_builder = DifferenceSegementsBuilder::build();
-                img_a.rows().zip(img_b.rows()).for_each(|(r_a, r_b)| r_a);
+            PageSimilarity::Similar(index, sim) => {
+                if *sim == 0 {
+                    Comparison::Identical
+                } else {
+                    let img_b = img_b.get(*index).unwrap();
+                    let num_rows = img_a.rows().len();
+                    let mut difference_builder = DifferenceSegementsBuilder::build();
+                    img_a
+                        .rows()
+                        .zip(img_b.rows())
+                        .enumerate()
+                        .for_each(|(index, (r_a, r_b))| {
+                            let mut equal = true;
+                            for (p_a, p_b) in r_a.zip(r_b) {
+                                if p_a != p_b {
+                                    equal = false;
+                                    break;
+                                }
+                            }
+                            difference_builder.step(index as f64 / (num_rows - 1) as f64, !equal);
+                        });
+                    Comparison::Different(difference_builder.finish())
+                }
             }
         }
     }
@@ -105,21 +124,25 @@ enum PDFComparisonError {
     UnableToRenderPDF(PdfiumError),
 }
 
+fn get_pdfium() -> Pdfium {
+    Pdfium::new(
+        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+            "../plugins/timeline_plugin_documents/pdfium",
+        ))
+        .or_else(|_| {
+            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("../pdfium"))
+        })
+        .unwrap(),
+    )
+}
+
 struct PDFComparison {
     pdfium: Arc<Pdfium>,
 }
 
 impl PDFComparison {
     pub fn new() -> Self {
-        let pdfium = Pdfium::new(
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
-                "../plugins/timeline_plugin_documents/pdfium",
-            ))
-            .or_else(|_| {
-                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("../pdfium"))
-            })
-            .unwrap(),
-        );
+        let pdfium = get_pdfium();
 
         PDFComparison {
             pdfium: Arc::new(pdfium),
@@ -148,9 +171,14 @@ impl PDFComparison {
 
         let page_similarities = PDFComparison::find_min_similarity_for_images(&images_a, &images_b);
 
-        println!("{:?}", page_similarities);
-
-        Ok(Vec::new())
+        //println!("{:?}", page_similarities);
+        Ok(page_similarities
+            .par_iter()
+            .enumerate()
+            .map(|(index, sim)| {
+                Comparison::from_similarity(sim, images_a.get(index).unwrap(), &images_b)
+            })
+            .collect())
     }
 
     fn find_min_similarity_for_images(
@@ -212,6 +240,57 @@ impl PDFComparison {
                 }
             })
             .collect()
+    }
+}
+
+enum PDFEditorError {
+    UnableToLoadPDF(PdfiumError),
+}
+
+struct PDFEditor {
+    pdfium: Arc<Pdfium>,
+}
+
+impl PDFEditor {
+    pub fn new() -> Self {
+        PDFEditor {
+            pdfium: Arc::new(get_pdfium()),
+        }
+    }
+
+    pub fn mark_differences(
+        &self,
+        in_path: &Path,
+        differences: &Vec<Comparison>,
+        out_path: &Path,
+    ) -> Result<(), PDFEditorError> {
+        let mut pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
+            Ok(v) => v,
+            Err(e) => return Err(PDFEditorError::UnableToLoadPDF(e)),
+        };
+
+        differences
+            .iter()
+            .enumerate()
+            .filter_map(|(index, difference)| match difference {
+                Comparison::Identical => None,
+                Comparison::Different(seg) => match pdf.pages().get(index as u16) {
+                    Ok(mut p) => {
+                        self.mark_page_differences(p, seg);
+                        Some(p)
+                    }
+                    Err(_) => None,
+                },
+            });
+
+        Ok(())
+    }
+
+    fn mark_page_differences(&self, page: &mut PdfPage, segments: &DifferenceSegments) {
+        //let page_width = page.width();
+
+        let page_height = page.height();
+        let buffer = ImageBuffer::new(5, page_height * 5);
     }
 }
 
