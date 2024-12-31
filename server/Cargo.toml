@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pdfium-render = "0.8.27"
+image = "0.25.5"
+pdfium-render = { version = "0.8.27", features = ["sync"] }
+rayon = "1.10.0"
