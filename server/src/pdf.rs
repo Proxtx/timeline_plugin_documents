@@ -1,4 +1,4 @@
-use image::{ImageBuffer, RgbImage};
+use image::{ImageBuffer, Rgb, RgbImage};
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
@@ -243,6 +243,7 @@ impl PDFComparison {
     }
 }
 
+#[derive(Debug)]
 enum PDFEditorError {
     UnableToLoadPDF(PdfiumError),
 }
@@ -264,7 +265,7 @@ impl PDFEditor {
         differences: &Vec<Comparison>,
         out_path: &Path,
     ) -> Result<(), PDFEditorError> {
-        let mut pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
+        let pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
             Ok(v) => v,
             Err(e) => return Err(PDFEditorError::UnableToLoadPDF(e)),
         };
@@ -276,21 +277,37 @@ impl PDFEditor {
                 Comparison::Identical => None,
                 Comparison::Different(seg) => match pdf.pages().get(index as u16) {
                     Ok(mut p) => {
-                        self.mark_page_differences(p, seg);
+                        self.mark_page_differences(&pdf, &mut p, seg);
                         Some(p)
                     }
                     Err(_) => None,
                 },
             });
 
+        pdf.save_to_file(out_path);
+
         Ok(())
     }
 
-    fn mark_page_differences(&self, page: &mut PdfPage, segments: &DifferenceSegments) {
+    fn mark_page_differences<'a>(
+        &self,
+        doc: &PdfDocument<'a>,
+        page: &mut PdfPage<'a>,
+        segments: &DifferenceSegments,
+    ) {
         //let page_width = page.width();
 
         let page_height = page.height();
-        let buffer = ImageBuffer::new(5, page_height * 5);
+        let mut buffer = RgbImage::new(5, page_height.value as u32);
+        buffer.put_pixel(5, 5, Rgb([255, 0, 0]));
+        buffer.put_pixel(5, 6, Rgb([255, 0, 0]));
+        buffer.put_pixel(5, 7, Rgb([255, 0, 0]));
+        buffer.put_pixel(6, 5, Rgb([255, 0, 0]));
+        buffer.put_pixel(6, 6, Rgb([255, 0, 0]));
+        buffer.put_pixel(6, 7, Rgb([255, 0, 0]));
+        let mut object =
+            PdfPageImageObject::new_with_height(doc, &buffer.into(), page_height).unwrap();
+        page.objects_mut().add_image_object(object).unwrap();
     }
 }
 
@@ -298,7 +315,7 @@ impl PDFEditor {
 mod pdf_comparison {
     use std::path::PathBuf;
 
-    use super::PDFComparison;
+    use super::{PDFComparison, PDFEditor};
 
     #[test]
     fn init_pdfium() {
@@ -315,5 +332,23 @@ mod pdf_comparison {
             )
             .unwrap();
         println!("{:?}", cmp);
+    }
+
+    #[test]
+    fn annotation() {
+        let strct = PDFComparison::new();
+        let cmp = strct
+            .compare_pdfs(
+                &PathBuf::from("./new_dev.pdf"),
+                &PathBuf::from("./old_dev.pdf"),
+            )
+            .unwrap();
+        let edtr = PDFEditor::new();
+        edtr.mark_differences(
+            &PathBuf::from("./new_pdf.pdf"),
+            &cmp,
+            &PathBuf::from("./newest_dev.pdf"),
+        )
+        .unwrap();
     }
 }
