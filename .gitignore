@@ -23,3 +23,4 @@ Cargo.lock
 pdfium/
 server/new_dev.pdf
 server/old_dev.pdf
+server/newest_dev.pdf

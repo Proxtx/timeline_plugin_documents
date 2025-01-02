@@ -1,9 +1,8 @@
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::{RgbImage, Rgba, RgbaImage};
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::{path::Path, thread};
 
 #[derive(Debug)]
@@ -141,12 +140,8 @@ struct PDFComparison {
 }
 
 impl PDFComparison {
-    pub fn new() -> Self {
-        let pdfium = get_pdfium();
-
-        PDFComparison {
-            pdfium: Arc::new(pdfium),
-        }
+    pub fn new(pdfium: Arc<Pdfium>) -> Self {
+        PDFComparison { pdfium }
     }
 
     pub fn compare_pdfs(&self, a: &Path, b: &Path) -> Result<Vec<Comparison>, PDFComparisonError> {
@@ -253,10 +248,8 @@ struct PDFEditor {
 }
 
 impl PDFEditor {
-    pub fn new() -> Self {
-        PDFEditor {
-            pdfium: Arc::new(get_pdfium()),
-        }
+    pub fn new(pdfium: Arc<Pdfium>) -> Self {
+        PDFEditor { pdfium }
     }
 
     pub fn mark_differences(
@@ -265,23 +258,32 @@ impl PDFEditor {
         differences: &Vec<Comparison>,
         out_path: &Path,
     ) -> Result<(), PDFEditorError> {
-        let pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
+        let mut pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
             Ok(v) => v,
             Err(e) => return Err(PDFEditorError::UnableToLoadPDF(e)),
         };
 
+        let mut page_shift: i16 = 0;
+
         differences
             .iter()
             .enumerate()
-            .filter_map(|(index, difference)| match difference {
-                Comparison::Identical => None,
-                Comparison::Different(seg) => match pdf.pages().get(index as u16) {
-                    Ok(mut p) => {
-                        self.mark_page_differences(&pdf, &mut p, seg);
-                        Some(p)
-                    }
-                    Err(_) => None,
-                },
+            .for_each(|(index, difference)| match difference {
+                Comparison::Identical => {
+                    let _ = pdf
+                        .pages_mut()
+                        .get((index as i16 + page_shift) as u16)
+                        .unwrap()
+                        .delete();
+                    page_shift -= 1;
+                }
+                Comparison::Different(seg) => {
+                    let mut p = pdf
+                        .pages_mut()
+                        .get((index as i16 + page_shift) as u16)
+                        .unwrap();
+                    self.mark_page_differences(&pdf, &mut p, seg);
+                }
             });
 
         pdf.save_to_file(out_path);
@@ -295,36 +297,45 @@ impl PDFEditor {
         page: &mut PdfPage<'a>,
         segments: &DifferenceSegments,
     ) {
-        //let page_width = page.width();
+        let image_width = page.width().value as u32 * 5;
+        let image_height = page.height().value as u32 * 5;
 
-        let page_height = page.height();
-        let mut buffer = RgbImage::new(5, page_height.value as u32);
-        buffer.put_pixel(5, 5, Rgb([255, 0, 0]));
-        buffer.put_pixel(5, 6, Rgb([255, 0, 0]));
-        buffer.put_pixel(5, 7, Rgb([255, 0, 0]));
-        buffer.put_pixel(6, 5, Rgb([255, 0, 0]));
-        buffer.put_pixel(6, 6, Rgb([255, 0, 0]));
-        buffer.put_pixel(6, 7, Rgb([255, 0, 0]));
-        let mut object =
-            PdfPageImageObject::new_with_height(doc, &buffer.into(), page_height).unwrap();
+        let mut buffer = RgbaImage::new(image_width, image_height);
+
+        segments.segments.iter().for_each(|(start, end)| {
+            (((image_height as f64 * *start).floor() as u32)
+                ..=(image_height as f64 * *end).floor() as u32)
+                .for_each(|row| {
+                    (0..10.min(image_width)).for_each(|column| {
+                        buffer.put_pixel(column, row, Rgba([255, 0, 0, 255]));
+                    });
+                });
+        });
+
+        let object =
+            PdfPageImageObject::new_with_height(doc, &buffer.into(), page.height()).unwrap();
         page.objects_mut().add_image_object(object).unwrap();
     }
 }
 
 #[cfg(test)]
 mod pdf_comparison {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
+
+    use crate::pdf::get_pdfium;
 
     use super::{PDFComparison, PDFEditor};
 
     #[test]
     fn init_pdfium() {
-        PDFComparison::new();
+        let pdfium = Arc::new(get_pdfium());
+        PDFComparison::new(pdfium);
     }
 
     #[test]
     fn comparison() {
-        let strct = PDFComparison::new();
+        let pdfium = Arc::new(get_pdfium());
+        let strct = PDFComparison::new(pdfium);
         let cmp = strct
             .compare_pdfs(
                 &PathBuf::from("./new_dev.pdf"),
@@ -336,16 +347,19 @@ mod pdf_comparison {
 
     #[test]
     fn annotation() {
-        let strct = PDFComparison::new();
+        let pdfium = Arc::new(get_pdfium());
+        let strct = PDFComparison::new(pdfium.clone());
         let cmp = strct
             .compare_pdfs(
                 &PathBuf::from("./new_dev.pdf"),
                 &PathBuf::from("./old_dev.pdf"),
             )
             .unwrap();
-        let edtr = PDFEditor::new();
+        println!("Got comparison. Now loading pdfium.");
+        let edtr = PDFEditor::new(pdfium.clone());
+        println!("Ok good");
         edtr.mark_differences(
-            &PathBuf::from("./new_pdf.pdf"),
+            &PathBuf::from("./new_dev.pdf"),
             &cmp,
             &PathBuf::from("./newest_dev.pdf"),
         )
