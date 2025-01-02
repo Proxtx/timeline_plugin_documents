@@ -7,6 +7,7 @@ use std::{
     time::SystemTime,
 };
 
+use pdfium_render::prelude::Pdfium;
 use server_api::external::{
     futures::{
         future::{join_all, BoxFuture},
@@ -70,7 +71,7 @@ impl From<&Metadata> for FileTypeEnum {
 }
 
 struct FileManager {
-    input_path: PathBuf,
+    current_path: PathBuf,
     last_path: PathBuf,
     diff_path: PathBuf,
     pdf_comparison: PDFComparison,
@@ -78,45 +79,57 @@ struct FileManager {
 }
 
 impl FileManager {
-    pub fn new(input_path: PathBuf, last_path: PathBuf, diff_path: PathBuf) -> Self {
-        let pdfium = Arc::new(get_pdfium());
-
+    pub fn new(
+        pdfium: Arc<Pdfium>,
+        current_path: PathBuf,
+        last_path: PathBuf,
+        diff_path: PathBuf,
+    ) -> Self {
         FileManager {
             diff_path,
-            input_path,
+            current_path,
             last_path,
             pdf_comparison: PDFComparison::new(pdfium.clone()),
             pdf_editor: PDFEditor::new(pdfium),
         }
     }
 
-    async fn update(&self) -> Result<HashMap<PathBuf, FileManagerError>, FileManagerError> {
+    async fn update(
+        &self,
+    ) -> Result<HashMap<PathBuf, Result<PathBuf, FileManagerError>>, FileManagerError> {
         let updated_files =
-            FileManager::find_updated_files(self.input_path.clone(), self.last_path.clone())
+            FileManager::find_updated_files(self.current_path.clone(), self.last_path.clone())
                 .await?
                 .into_iter()
                 .collect::<HashMap<_, _>>();
         let comparsions = self.generate_comparisons(&updated_files)?;
         let updated_pdfs = self.generate_updated_pdfs(&comparsions);
+        let post_update_status = self.update_changed_pdfs(updated_pdfs, &updated_files).await;
+        Ok(post_update_status
+            .into_iter()
+            .map(|(associated_current_path, result)| {
+                (associated_current_path.to_path_buf(), result)
+            })
+            .collect())
     }
 
     async fn update_changed_pdfs<'a>(
         &self,
         updated_pdfs: HashMap<&'a Path, Result<PathBuf, FileManagerError>>,
         associations: &'a HashMap<PathBuf, PathBuf>,
-    ) -> HashMap<&'a Path, Result<&'a Path, FileManagerError>> {
-        join_all(updated_pdfs.into_iter().map(|(path, result)| async {
-            match result {
-                Ok(diff_path) => match copy(path, associations.get(path.clone()).unwrap()).await {
-                    Err(e) => (*path, Err(FileManagerError::Io(e))),
-                    Ok(_) => (*path, Ok(diff_path.as_path())),
+    ) -> HashMap<&'a Path, Result<PathBuf, FileManagerError>> {
+        let mut res = HashMap::new();
+        for (path, result) in updated_pdfs.into_iter() {
+            let cres = match result {
+                Ok(diff_path) => match copy(path, associations.get(path).unwrap()).await {
+                    Err(e) => (path, Err(FileManagerError::Io(e))),
+                    Ok(_) => (path, Ok(diff_path)),
                 },
-                Err(e) => (*path, Err(e)),
-            }
-        }))
-        .await
-        .into_iter()
-        .collect()
+                Err(e) => (path, Err(e)),
+            };
+            res.insert(cres.0, cres.1);
+        }
+        res
     }
 
     fn generate_updated_pdfs<'a>(
@@ -228,5 +241,24 @@ impl FileManager {
             Ok(result)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod file_manager_test {
+    use server_api::external::tokio;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn update() {
+        let pdfium = Arc::new(get_pdfium());
+        let file_manager = FileManager::new(
+            pdfium,
+            PathBuf::from("./current"),
+            PathBuf::from("./last"),
+            PathBuf::from("./diff"),
+        );
+        file_manager.update().await.unwrap();
     }
 }

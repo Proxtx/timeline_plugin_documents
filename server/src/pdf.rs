@@ -348,7 +348,7 @@ impl PDFEditor {
 
         segments.segments.iter().for_each(|(start, end)| {
             (((image_height as f64 * *start).floor() as u32)
-                ..=(image_height as f64 * *end).floor() as u32)
+                ..(image_height as f64 * *end).floor() as u32)
                 .for_each(|row| {
                     (0..10.min(image_width)).for_each(|column| {
                         buffer.put_pixel(column, row, Rgba([255, 0, 0, 255]));
