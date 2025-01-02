@@ -1,6 +1,7 @@
 use image::{RgbImage, Rgba, RgbaImage};
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
+use std::error::Error;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{path::Path, thread};
@@ -121,6 +122,25 @@ enum PageSimilarity {
 enum PDFComparisonError {
     UnableToLoadPDF(PdfiumError),
     UnableToRenderPDF(PdfiumError),
+    PdfiumError(PdfiumError),
+}
+
+impl Error for PDFComparisonError {}
+
+impl std::fmt::Display for PDFComparisonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnableToLoadPDF(e) => write!(f, "Was unable to load pdf: {}", e),
+            Self::UnableToRenderPDF(e) => write!(f, "Was unable to render a pdf. Error: {}", e),
+            Self::PdfiumError(e) => write!(f, "Unkown or unexpected pdfium error: {}", e),
+        }
+    }
+}
+
+impl From<PdfiumError> for PDFComparisonError {
+    fn from(value: PdfiumError) -> Self {
+        Self::PdfiumError(value)
+    }
 }
 
 fn get_pdfium() -> Pdfium {
@@ -131,7 +151,7 @@ fn get_pdfium() -> Pdfium {
         .or_else(|_| {
             Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("../pdfium"))
         })
-        .unwrap(),
+        .expect("Was unable to load pdfium."),
     )
 }
 
@@ -152,12 +172,7 @@ impl PDFComparison {
             (Err(e), _) | (_, Err(e)) => return Err(PDFComparisonError::UnableToLoadPDF(e)),
         };
 
-        let images = thread::scope(|s| {
-            //let handle_a = s.spawn(|| self.extract_images(pdf_a));
-            //let handle_b = s.spawn(|| self.extract_images(pdf_b));
-            //(handle_a.join().unwrap(), handle_b.join().unwrap())
-            (self.extract_images(pdf_a), self.extract_images(pdf_b))
-        });
+        let images = (self.extract_images(pdf_a), self.extract_images(pdf_b));
 
         let (images_a, images_b) = match images {
             (Ok(images_a), Ok(images_b)) => (images_a, images_b),
@@ -166,7 +181,6 @@ impl PDFComparison {
 
         let page_similarities = PDFComparison::find_min_similarity_for_images(&images_a, &images_b);
 
-        //println!("{:?}", page_similarities);
         Ok(page_similarities
             .par_iter()
             .enumerate()
@@ -223,17 +237,12 @@ impl PDFComparison {
             .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true);
 
         (0..pdf.pages().len())
-            .map(|p_index| {
-                match pdf
-                    .pages()
-                    .get(p_index)
-                    .unwrap()
-                    .render_with_config(&render_config)
-                {
+            .map(
+                |p_index| match pdf.pages().get(p_index)?.render_with_config(&render_config) {
                     Ok(bitmap) => Ok(bitmap.as_image().into_rgb8()),
                     Err(e) => Err(PDFComparisonError::UnableToRenderPDF(e)),
-                }
-            })
+                },
+            )
             .collect()
     }
 }
@@ -241,6 +250,32 @@ impl PDFComparison {
 #[derive(Debug)]
 enum PDFEditorError {
     UnableToLoadPDF(PdfiumError),
+    UnableToSavePDF(PdfiumError),
+    UnableToModifyPDF(PdfiumError),
+    PdfiumError(PdfiumError),
+}
+
+impl Error for PDFEditorError {}
+
+impl std::fmt::Display for PDFEditorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnableToLoadPDF(e) => write!(f, "Was unable to load a pdf. Error: {}", e),
+            Self::PdfiumError(e) => write!(f, "Unkown or unexpected pdfium error: {}", e),
+            Self::UnableToSavePDF(e) => write!(f, "Was unable to save the pdf: {}", e),
+            Self::UnableToModifyPDF(e) => write!(
+                f,
+                "Was unable to create pdf object or modify the pdf. Error: {}",
+                e
+            ),
+        }
+    }
+}
+
+impl From<PdfiumError> for PDFEditorError {
+    fn from(value: PdfiumError) -> Self {
+        PDFEditorError::PdfiumError(value)
+    }
 }
 
 struct PDFEditor {
@@ -255,7 +290,7 @@ impl PDFEditor {
     pub fn mark_differences(
         &self,
         in_path: &Path,
-        differences: &Vec<Comparison>,
+        differences: &[Comparison],
         out_path: &Path,
     ) -> Result<(), PDFEditorError> {
         let mut pdf = match self.pdfium.load_pdf_from_file(in_path, None) {
@@ -268,25 +303,25 @@ impl PDFEditor {
         differences
             .iter()
             .enumerate()
-            .for_each(|(index, difference)| match difference {
+            .try_for_each(|(index, difference)| match difference {
                 Comparison::Identical => {
                     let _ = pdf
                         .pages_mut()
-                        .get((index as i16 + page_shift) as u16)
-                        .unwrap()
+                        .get((index as i16 + page_shift) as u16)?
                         .delete();
                     page_shift -= 1;
+                    Ok::<(), PDFEditorError>(())
                 }
                 Comparison::Different(seg) => {
-                    let mut p = pdf
-                        .pages_mut()
-                        .get((index as i16 + page_shift) as u16)
-                        .unwrap();
-                    self.mark_page_differences(&pdf, &mut p, seg);
+                    let mut p = pdf.pages_mut().get((index as i16 + page_shift) as u16)?;
+                    self.mark_page_differences(&pdf, &mut p, seg)?;
+                    Ok(())
                 }
-            });
+            })?;
 
-        pdf.save_to_file(out_path);
+        if let Err(e) = pdf.save_to_file(out_path) {
+            return Err(PDFEditorError::UnableToSavePDF(e));
+        }
 
         Ok(())
     }
@@ -296,7 +331,7 @@ impl PDFEditor {
         doc: &PdfDocument<'a>,
         page: &mut PdfPage<'a>,
         segments: &DifferenceSegments,
-    ) {
+    ) -> Result<(), PDFEditorError> {
         let image_width = page.width().value as u32 * 5;
         let image_height = page.height().value as u32 * 5;
 
@@ -312,9 +347,15 @@ impl PDFEditor {
                 });
         });
 
-        let object =
-            PdfPageImageObject::new_with_height(doc, &buffer.into(), page.height()).unwrap();
-        page.objects_mut().add_image_object(object).unwrap();
+        let object = match PdfPageImageObject::new_with_height(doc, &buffer.into(), page.height()) {
+            Ok(v) => v,
+            Err(e) => return Err(PDFEditorError::UnableToModifyPDF(e)),
+        };
+
+        if let Err(e) = page.objects_mut().add_image_object(object) {
+            return Err(PDFEditorError::UnableToModifyPDF(e));
+        }
+        Ok(())
     }
 }
 
