@@ -7,3 +7,4 @@ edition = "2021"
 image = "0.25.5"
 pdfium-render = { version = "0.8.27", features = ["sync", "thread_safe"] }
 rayon = "1.10.0"
+server_api = { path = "../../../server_api/" }

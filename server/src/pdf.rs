@@ -2,12 +2,12 @@ use image::{RgbImage, Rgba, RgbaImage};
 use pdfium_render::prelude::*;
 use rayon::prelude::*;
 use std::error::Error;
+use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::{path::Path, thread};
 
 #[derive(Debug)]
-enum Comparison {
+pub enum Comparison {
     Identical,
     Different(DifferenceSegments),
 }
@@ -91,7 +91,7 @@ impl DifferenceSegementsBuilder {
 }
 
 #[derive(Debug)]
-struct DifferenceSegments {
+pub struct DifferenceSegments {
     pub segments: Vec<(f64, f64)>,
 }
 
@@ -119,7 +119,7 @@ enum PageSimilarity {
 }
 
 #[derive(Debug)]
-enum PDFComparisonError {
+pub enum PDFComparisonError {
     UnableToLoadPDF(PdfiumError),
     UnableToRenderPDF(PdfiumError),
     PdfiumError(PdfiumError),
@@ -143,7 +143,7 @@ impl From<PdfiumError> for PDFComparisonError {
     }
 }
 
-fn get_pdfium() -> Pdfium {
+pub fn get_pdfium() -> Pdfium {
     Pdfium::new(
         Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
             "../plugins/timeline_plugin_documents/pdfium",
@@ -155,7 +155,7 @@ fn get_pdfium() -> Pdfium {
     )
 }
 
-struct PDFComparison {
+pub struct PDFComparison {
     pdfium: Arc<Pdfium>,
 }
 
@@ -169,7 +169,16 @@ impl PDFComparison {
         let pdf_b = self.pdfium.load_pdf_from_file(b, None);
         let (pdf_a, pdf_b) = match (pdf_a, pdf_b) {
             (Ok(pdf_a), Ok(pdf_b)) => (Arc::new(pdf_a), Arc::new(pdf_b)),
-            (Err(e), _) | (_, Err(e)) => return Err(PDFComparisonError::UnableToLoadPDF(e)),
+            (Ok(pdf_a), Err(_e)) => {
+                return Ok((0..pdf_a.pages().len())
+                    .map(|_| {
+                        Comparison::Different(DifferenceSegments {
+                            segments: vec![(0., 1.)],
+                        })
+                    })
+                    .collect())
+            }
+            (Err(e), _) => return Err(PDFComparisonError::UnableToLoadPDF(e)),
         };
 
         let images = (self.extract_images(pdf_a), self.extract_images(pdf_b));
@@ -248,7 +257,7 @@ impl PDFComparison {
 }
 
 #[derive(Debug)]
-enum PDFEditorError {
+pub enum PDFEditorError {
     UnableToLoadPDF(PdfiumError),
     UnableToSavePDF(PdfiumError),
     UnableToModifyPDF(PdfiumError),
@@ -278,7 +287,7 @@ impl From<PdfiumError> for PDFEditorError {
     }
 }
 
-struct PDFEditor {
+pub struct PDFEditor {
     pdfium: Arc<Pdfium>,
 }
 
