@@ -14,6 +14,7 @@ use server_api::external::{
         FutureExt,
     },
     tokio::fs::{copy, metadata, read_dir, File},
+    types::external::chrono,
 };
 
 use crate::pdf::{
@@ -21,7 +22,7 @@ use crate::pdf::{
 };
 
 #[derive(Debug)]
-enum FileManagerError {
+pub enum FileManagerError {
     Io(io::Error),
     PDFComparisonError(PDFComparisonError),
     PDFEditorError(PDFEditorError),
@@ -70,7 +71,7 @@ impl From<&Metadata> for FileTypeEnum {
     }
 }
 
-struct FileManager {
+pub struct FileManager {
     current_path: PathBuf,
     last_path: PathBuf,
     diff_path: PathBuf,
@@ -94,7 +95,7 @@ impl FileManager {
         }
     }
 
-    async fn update(
+    pub async fn update(
         &self,
     ) -> Result<HashMap<PathBuf, Result<PathBuf, FileManagerError>>, FileManagerError> {
         let updated_files =
@@ -146,10 +147,7 @@ impl FileManager {
                 let outpath = self.diff_path.join(format!(
                     "{}.diff.{}.pdf",
                     filename,
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
+                    chrono::Utc::now().timestamp()
                 ));
                 if let Err(e) = self
                     .pdf_editor
