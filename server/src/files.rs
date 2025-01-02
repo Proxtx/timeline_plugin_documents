@@ -4,11 +4,15 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use server_api::external::{
-    futures::{future::BoxFuture, FutureExt},
-    tokio::fs::{metadata, read_dir, File},
+    futures::{
+        future::{join_all, BoxFuture},
+        FutureExt,
+    },
+    tokio::fs::{copy, metadata, read_dir, File},
 };
 
 use crate::pdf::{
@@ -86,46 +90,78 @@ impl FileManager {
         }
     }
 
-    async fn update(&self) -> Result<(), FileManagerError> {
+    async fn update(&self) -> Result<HashMap<PathBuf, FileManagerError>, FileManagerError> {
         let updated_files =
             FileManager::find_updated_files(self.input_path.clone(), self.last_path.clone())
-                .await?;
-
-        Ok(())
+                .await?
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+        let comparsions = self.generate_comparisons(&updated_files)?;
+        let updated_pdfs = self.generate_updated_pdfs(&comparsions);
     }
 
-    fn generate_updated_pdfs(
+    async fn update_changed_pdfs<'a>(
         &self,
-        tasks: HashMap<&Path, Vec<Comparison>>,
-    ) -> Result<OutPdfs, FileManagerError> {
+        updated_pdfs: HashMap<&'a Path, Result<PathBuf, FileManagerError>>,
+        associations: &'a HashMap<PathBuf, PathBuf>,
+    ) -> HashMap<&'a Path, Result<&'a Path, FileManagerError>> {
+        join_all(updated_pdfs.into_iter().map(|(path, result)| async {
+            match result {
+                Ok(diff_path) => match copy(path, associations.get(path.clone()).unwrap()).await {
+                    Err(e) => (*path, Err(FileManagerError::Io(e))),
+                    Ok(_) => (*path, Ok(diff_path.as_path())),
+                },
+                Err(e) => (*path, Err(e)),
+            }
+        }))
+        .await
+        .into_iter()
+        .collect()
+    }
+
+    fn generate_updated_pdfs<'a>(
+        &self,
+        tasks: &HashMap<&'a Path, Vec<Comparison>>,
+    ) -> HashMap<&'a Path, Result<PathBuf, FileManagerError>> {
         tasks
             .iter()
             .map(|(path, comparisons)| {
-                self.pdf_editor
-                    .mark_differences(&path, &comparisons, out_path)
+                let filename = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("unknown_filename");
+                let outpath = self.diff_path.join(format!(
+                    "{}.diff.{}.pdf",
+                    filename,
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                ));
+                if let Err(e) = self
+                    .pdf_editor
+                    .mark_differences(path, comparisons, &outpath)
+                {
+                    return (*path, Err(FileManagerError::PDFEditorError(e)));
+                }
+                (path, Ok(outpath))
             })
             .collect()
     }
 
     fn generate_comparisons<'a>(
         &self,
-        files: &'a [(PathBuf, PathBuf)],
+        files: &'a HashMap<PathBuf, PathBuf>,
     ) -> Result<HashMap<&'a Path, Vec<Comparison>>, FileManagerError> {
         files
             .iter()
             .filter_map(|(current_path, last_path)| {
                 match self.pdf_comparison.compare_pdfs(current_path, last_path) {
                     Ok(res) => {
-                        if res
-                            .iter()
-                            .find(|v| match v {
-                                Comparison::Different(_) => true,
-                                Comparison::Identical => false,
-                            })
-                            .is_none()
-                        {
-                            return None;
-                        }
+                        res.iter().find(|v| match v {
+                            Comparison::Different(_) => true,
+                            Comparison::Identical => false,
+                        })?;
                         Some(Ok((current_path.as_path(), res)))
                     }
                     Err(e) => Some(Err(FileManagerError::PDFComparisonError(e))),
