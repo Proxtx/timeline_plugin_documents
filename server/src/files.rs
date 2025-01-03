@@ -28,6 +28,18 @@ pub enum FileManagerError {
     PDFEditorError(PDFEditorError),
 }
 
+impl std::error::Error for FileManagerError {}
+
+impl std::fmt::Display for FileManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO Error: {}", e),
+            Self::PDFComparisonError(e) => write!(f, "PDFComparison Error: {}", e),
+            Self::PDFEditorError(e) => write!(f, "PDFEditor Error: {}", e),
+        }
+    }
+}
+
 impl From<io::Error> for FileManagerError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
@@ -72,9 +84,9 @@ impl From<&Metadata> for FileTypeEnum {
 }
 
 pub struct FileManager {
-    current_path: PathBuf,
-    last_path: PathBuf,
-    diff_path: PathBuf,
+    pub current_path: PathBuf,
+    pub last_path: PathBuf,
+    pub diff_path: PathBuf,
     pdf_comparison: PDFComparison,
     pdf_editor: PDFEditor,
 }

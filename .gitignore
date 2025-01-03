@@ -27,3 +27,5 @@ server/newest_dev.pdf
 server/current
 server/diff
 server/last
+server/key
+server/key.pub

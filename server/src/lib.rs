@@ -1,11 +1,24 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{fmt::format, path::PathBuf, sync::Arc};
 
 use crate::types::available_plugins::AvailablePlugins;
 use files::FileManager;
 use pdf::get_pdfium;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use server_api::{
-    external::{toml, types},
+    external::{
+        futures::{future::join_all, FutureExt, StreamExt},
+        tokio::fs::read_dir,
+        toml,
+        types::{
+            self,
+            api::{APIError, CompressedEvent},
+            external::{
+                chrono::{DateTime, Duration, Utc},
+                serde_json,
+            },
+        },
+    },
     plugin::PluginData,
 };
 
@@ -77,6 +90,30 @@ impl server_api::plugin::PluginTrait for Plugin {
                 + 'a,
         >,
     > {
+        async move {
+            for mngr in self.file_managers.iter() {
+                let res = mngr.update().await;
+                match res {
+                    Ok(v) => {
+                        v.iter().for_each(|v| {
+                            if let Err(e) = v.1 {
+                                self.plugin_data.report_error_string(format!(
+                                    "Was unable to update document: {}. FileManagerError: {}",
+                                    v.0.display(),
+                                    e
+                                ));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        self.plugin_data
+                            .report_error_string(format!("Unable initialize Document Scan: {}", e));
+                    }
+                }
+            }
+            Some(Duration::minutes(1))
+        }
+        .boxed()
     }
 
     fn get_compressed_events(
@@ -89,6 +126,86 @@ impl server_api::plugin::PluginTrait for Plugin {
                 > + Send,
         >,
     > {
-        todo!()
+        let file_managers = self.file_managers.clone();
+        let range = query_range.clone();
+
+        async move {
+            Ok(join_all(
+                join_all(
+                    file_managers
+                        .iter()
+                        .map(|v| read_dir(&v.diff_path))
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .into_iter()
+                .map(|v| async move {
+                    match v {
+                        Ok(mut v) => {
+                            let mut res = Vec::new();
+                            while let Some(v) = match v.next_entry().await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return Err(APIError::Custom(format!(
+                                        "IO Error unable to read file entry: {}",
+                                        e
+                                    )))
+                                }
+                            } {
+                                res.push(v.path());
+                            }
+                            Ok(res)
+                        }
+                        Err(e) => Err(APIError::Custom(format!(
+                            "Unable to read diff documents. IO Error: {}",
+                            e
+                        ))),
+                    }
+                })
+                .collect::<Vec<_>>(),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, APIError>>()?
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                f.file_name()
+                    .and_then(|v| v.to_str())
+                    .ok_or(APIError::Custom(
+                        "Unable to parse filename: Can't read filename".to_string(),
+                    ))
+                    .and_then(|v| {
+                        v.split('.')
+                            .rev()
+                            .nth(1)
+                            .ok_or(APIError::Custom(
+                                "Unable to parse filename. Filename is too short".to_string(),
+                            ))
+                            .and_then(|v| {
+                                v.parse::<i64>()
+                                    .map_err(|v| {
+                                        APIError::Custom(format!("Unable to parse filename. Not a valid number inside filename: {}", v))
+                                    })
+                                    .and_then(|t| {
+                                        DateTime::from_timestamp(t, 0)
+                                            .ok_or(APIError::Custom("Unable to parse filename. Unable to parse timestamp.".to_string()))
+                                            .map(|t| (f.clone(), v.to_string(), t))
+                                    })
+                            })
+                    })
+            })
+            .collect::<Result<Vec<_>, APIError>>()?
+            .into_iter()
+            .filter_map(|v| {
+                range.includes(&(v.2)).then(|| CompressedEvent {
+                    title: v.1,
+                    time: types::timing::Timing::Instant(v.2),
+                    data: serde_json::Value::Null,
+                })
+            })
+            .collect())
+        }
+        .boxed()
     }
 }
