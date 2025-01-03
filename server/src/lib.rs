@@ -1,14 +1,33 @@
-use std::{fmt::format, path::PathBuf, sync::Arc};
-
 use crate::types::available_plugins::AvailablePlugins;
+use base64::Engine;
 use files::FileManager;
 use pdf::get_pdfium;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rocket::get;
+use rocket::http::Status;
+use rocket::routes;
+use rocket::Build;
+use rocket::Rocket;
+use rocket::State;
+use rsa::pkcs1v15::Signature;
+use rsa::signature::RandomizedSigner;
+use rsa::signature::SignatureEncoding;
+use rsa::signature::Verifier;
+use rsa::{
+    pkcs1v15::{SigningKey, VerifyingKey},
+    pkcs8::DecodePrivateKey,
+    sha2::Sha256,
+    signature::Keypair,
+    RsaPrivateKey,
+};
 use serde::{Deserialize, Serialize};
 use server_api::{
     external::{
         futures::{future::join_all, FutureExt, StreamExt},
-        tokio::fs::read_dir,
+        tokio::{
+            fs::{read_dir, File},
+            io::AsyncReadExt,
+        },
         toml,
         types::{
             self,
@@ -21,6 +40,8 @@ use server_api::{
     },
     plugin::PluginData,
 };
+use std::str::FromStr;
+use std::{fmt::format, path::PathBuf, sync::Arc};
 
 mod files;
 mod pdf;
@@ -40,6 +61,8 @@ struct ConfigData {
 pub struct Plugin {
     plugin_data: PluginData,
     file_managers: Arc<Vec<FileManager>>,
+    signing_key: SigningKey<Sha256>,
+    verifying_key: VerifyingKey<Sha256>,
 }
 
 impl server_api::plugin::PluginTrait for Plugin {
@@ -65,6 +88,19 @@ impl server_api::plugin::PluginTrait for Plugin {
                 e
             )
         });
+        let mut key = String::new();
+        File::open("../plugins/timeline_plugin_documents/server/key")
+            .await
+            .expect("Documents Plugin: Unable to open encryption key.")
+            .read_to_string(&mut key)
+            .await
+            .expect("Documents Plugin: Unable to read key file to string");
+
+        let signing_key = SigningKey::new(
+            RsaPrivateKey::from_pkcs8_pem(&key)
+                .expect("Documents Plugin: Unable to parse encryption key!"),
+        );
+        let verifying_key = signing_key.verifying_key();
 
         let pdfium = Arc::new(get_pdfium());
 
@@ -77,6 +113,8 @@ impl server_api::plugin::PluginTrait for Plugin {
         Plugin {
             plugin_data: data,
             file_managers: Arc::new(file_managers),
+            signing_key,
+            verifying_key,
         }
     }
 
@@ -128,6 +166,7 @@ impl server_api::plugin::PluginTrait for Plugin {
     > {
         let file_managers = self.file_managers.clone();
         let range = query_range.clone();
+        let singing_key = self.signing_key.clone();
 
         async move {
             Ok(join_all(
@@ -198,14 +237,74 @@ impl server_api::plugin::PluginTrait for Plugin {
             .collect::<Result<Vec<_>, APIError>>()?
             .into_iter()
             .filter_map(|v| {
-                range.includes(&(v.2)).then(|| CompressedEvent {
+                range.includes(&(v.2)).then(||{ 
+                    let path = v.0.to_str().unwrap_or("").to_string(); 
+                    CompressedEvent {
                     title: v.1,
                     time: types::timing::Timing::Instant(v.2),
-                    data: serde_json::Value::Null,
-                })
+                    data: serde_json::to_value(SignedDocument {
+                        signature: sign_string(&singing_key, &path),
+                        path,
+                    }).unwrap(),
+                }})
             })
             .collect())
         }
         .boxed()
     }
+
+    fn get_routes() -> Vec<rocket::Route> {
+        routes![get_file]
+    }
+
+    fn rocket_build_access(&self, rocket: Rocket<Build>) -> Rocket<Build> {
+        rocket
+            .manage(VerifyingKeyWrapper(self.verifying_key.clone()))
+    }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SignedDocument {
+    path: String,
+    signature: String,
+}
+
+fn sign_string(signing_key: &SigningKey<Sha256>, string: &str) -> String {
+    let mut rng = rand::thread_rng();
+    let signature = signing_key.sign_with_rng(&mut rng, string.as_bytes());
+    base64::prelude::BASE64_STANDARD.encode(signature.to_vec())
+}
+
+fn verify_string(verifying_key: &VerifyingKey<Sha256>, string: &str, signature: &str) -> bool {
+    let bytes = match base64::prelude::BASE64_STANDARD.decode(signature) {
+        Ok(v) => v,
+        Err(_e) => return false,
+    };
+    let bytes_slice: &[u8] = &bytes;
+    verifying_key
+        .verify(
+            string.as_bytes(),
+            &match Signature::try_from(bytes_slice) {
+                Ok(v) => v,
+                Err(_e) => return false,
+            },
+        )
+        .is_ok()
+}
+
+#[get("/file/<file>/<signature>")]
+async fn get_file(
+    file: &str,
+    signature: &str,
+    verifying_key: &State<VerifyingKeyWrapper>,
+) -> (Status, Option<Result<File, std::io::Error>>) {
+    if !verify_string(&verifying_key.inner().0, file, signature) {
+        return (Status::Unauthorized, None);
+    }
+    match PathBuf::from_str(file) {
+        Ok(v) => (Status::Ok, (Some(File::open(v).await))),
+        Err(_) => (Status::BadRequest, None),
+    }
+}
+
+struct VerifyingKeyWrapper(pub VerifyingKey<Sha256>);

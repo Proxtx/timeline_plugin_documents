@@ -1,5 +1,5 @@
 [package]
-name = "server"
+name = "timeline_plugin_documents_server"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,6 +7,9 @@ edition = "2021"
 image = "0.25.5"
 pdfium-render = { version = "0.8.27", features = ["sync", "thread_safe"] }
 rayon = "1.10.0"
-rsa = "0.9.7"
-serde = { version = "1.0.217", features = ["derive"] }
+rsa = { version = "0.9.6", features = ["pem", "sha2"] }
+serde = { version = "1.0.215", features = ["derive"] }
 server_api = { path = "../../../server_api/" }
+rand = "0.8.5"
+base64 = "0.22.1"
+rocket = { version = "0.5.1", features = ["json"] }
