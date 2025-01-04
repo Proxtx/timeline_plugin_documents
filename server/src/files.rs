@@ -11,6 +11,7 @@ use {
         io,
         path::{Path, PathBuf},
         sync::Arc,
+        ffi::OsStr
     },
 };
 
@@ -110,8 +111,8 @@ impl FileManager {
                 .await?
                 .into_iter()
                 .collect::<HashMap<_, _>>();
-        let comparsions = self.generate_comparisons(&updated_files)?;
-        let updated_pdfs = self.generate_updated_pdfs(&comparsions);
+        let comparsions = self.generate_comparisons(&updated_files);
+        let updated_pdfs = self.generate_updated_pdfs(comparsions);
         let post_update_status = self.update_changed_pdfs(updated_pdfs, &updated_files).await;
         Ok(post_update_status
             .into_iter()
@@ -142,11 +143,12 @@ impl FileManager {
 
     fn generate_updated_pdfs<'a>(
         &self,
-        tasks: &HashMap<&'a Path, Vec<Comparison>>,
+        tasks: HashMap<&'a Path, Result<Vec<Comparison>, FileManagerError>>,
     ) -> HashMap<&'a Path, Result<PathBuf, FileManagerError>> {
         tasks
-            .iter()
+            .into_iter()
             .map(|(path, comparisons)| {
+                (path, comparisons.and_then(|comparisons| {
                 let filename = path
                     .file_name()
                     .and_then(|v| v.to_str())
@@ -158,11 +160,12 @@ impl FileManager {
                 ));
                 if let Err(e) = self
                     .pdf_editor
-                    .mark_differences(path, comparisons, &outpath)
+                    .mark_differences(path, &comparisons, &outpath)
                 {
-                    return (*path, Err(FileManagerError::PDFEditorError(e)));
+                    return Err(FileManagerError::PDFEditorError(e));
                 }
-                (path, Ok(outpath))
+                Ok(outpath)
+                }))
             })
             .collect()
     }
@@ -170,7 +173,7 @@ impl FileManager {
     fn generate_comparisons<'a>(
         &self,
         files: &'a HashMap<PathBuf, PathBuf>,
-    ) -> Result<HashMap<&'a Path, Vec<Comparison>>, FileManagerError> {
+    ) -> HashMap<&'a Path, Result<Vec<Comparison>, FileManagerError>> {
         files
             .iter()
             .filter_map(|(current_path, last_path)| {
@@ -180,13 +183,12 @@ impl FileManager {
                             Comparison::Different(_) => true,
                             Comparison::Identical => false,
                         })?;
-                        Some(Ok((current_path.as_path(), res)))
+                        Some((current_path.as_path(), Ok(res)))
                     }
-                    Err(e) => Some(Err(FileManagerError::PDFComparisonError(e))),
+                    Err(e) => Some((current_path.as_path(), Err(FileManagerError::PDFComparisonError(e)))),
                 }
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|v| v.into_iter().collect())
+            .collect()
     }
 
     fn find_updated_files(
@@ -206,7 +208,7 @@ impl FileManager {
                 match (file_type, last_path_metadata) {
                     (FileTypeEnum::File, Ok((FileTypeEnum::File, last_meta))) => {
                         let current_meta = metadata(entry.path()).await?;
-                        if current_meta.modified()? > last_meta.modified()? {
+                        if current_meta.modified()? > last_meta.modified()? && entry.path().extension() == Some(OsStr::new("pdf"))  {
                             result.push((entry.path(), last_path_file_path));
                         }
                     }
