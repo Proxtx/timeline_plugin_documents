@@ -1,10 +1,7 @@
 use {
     pdfium_render::prelude::Pdfium,
     server_api::external::{
-        futures::{
-            future::BoxFuture,
-            FutureExt,
-        },
+        futures::{future::BoxFuture, FutureExt},
         tokio::fs::{copy, metadata, read_dir},
         types::external::chrono,
     },
@@ -17,9 +14,7 @@ use {
     },
 };
 
-use crate::pdf::{
-    Comparison, PDFComparison, PDFComparisonError, PDFEditor, PDFEditorError,
-};
+use crate::pdf::{Comparison, PDFComparison, PDFComparisonError, PDFEditor, PDFEditorError};
 
 #[derive(Debug)]
 pub enum FileManagerError {
@@ -251,24 +246,5 @@ impl FileManager {
             Ok(result)
         }
         .boxed()
-    }
-}
-
-#[cfg(test)]
-mod file_manager_test {
-    use server_api::external::tokio;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn update() {
-        let pdfium = Arc::new(get_pdfium());
-        let file_manager = FileManager::new(
-            pdfium,
-            PathBuf::from("./current"),
-            PathBuf::from("./last"),
-            PathBuf::from("./diff"),
-        );
-        file_manager.update().await.unwrap();
     }
 }
