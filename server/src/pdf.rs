@@ -1,10 +1,13 @@
-use image::{RgbImage, Rgba, RgbaImage};
-use pdfium_render::prelude::*;
-use rayon::prelude::*;
-use std::error::Error;
-use std::path::Path;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use {
+    image::{RgbImage, Rgba, RgbaImage},
+    pdfium_render::prelude::*,
+    rayon::prelude::*,
+    std::{
+        error::Error,
+        path::Path,
+        sync::{atomic::AtomicUsize, Arc},
+    },
+};
 
 #[derive(Debug)]
 pub enum Comparison {
@@ -113,7 +116,7 @@ impl Similiarity {
 }
 
 #[derive(Debug)]
-enum PageSimilarity {
+pub enum PageSimilarity {
     Different,
     Similar(usize, usize),
 }

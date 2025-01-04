@@ -1,47 +1,38 @@
-use crate::types::available_plugins::AvailablePlugins;
-use base64::Engine;
-use files::FileManager;
-use pdf::get_pdfium;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use rocket::get;
-use rocket::http::Status;
-use rocket::routes;
-use rocket::Build;
-use rocket::Rocket;
-use rocket::State;
-use rsa::pkcs1v15::Signature;
-use rsa::signature::RandomizedSigner;
-use rsa::signature::SignatureEncoding;
-use rsa::signature::Verifier;
-use rsa::{
-    pkcs1v15::{SigningKey, VerifyingKey},
-    pkcs8::DecodePrivateKey,
-    sha2::Sha256,
-    signature::Keypair,
-    RsaPrivateKey,
-};
-use serde::{Deserialize, Serialize};
-use server_api::{
-    external::{
-        futures::{future::join_all, FutureExt, StreamExt},
-        tokio::{
-            fs::{read_dir, File},
-            io::AsyncReadExt,
-        },
-        toml,
-        types::{
-            self,
-            api::{APIError, CompressedEvent},
-            external::{
-                chrono::{DateTime, Duration, Utc},
-                serde_json,
+use {
+    crate::types::available_plugins::AvailablePlugins,
+    base64::Engine,
+    files::FileManager,
+    pdf::get_pdfium,
+    rocket::{fs::FileServer, get, http::Status, routes, Build, Rocket, State},
+    rsa::{
+        pkcs1v15::{Signature, SigningKey, VerifyingKey},
+        pkcs8::DecodePrivateKey,
+        sha2::Sha256,
+        signature::{Keypair, RandomizedSigner, SignatureEncoding, Verifier},
+        RsaPrivateKey,
+    },
+    serde::{Deserialize, Serialize},
+    server_api::{
+        external::{
+            futures::{future::join_all, FutureExt},
+            tokio::{
+                fs::{read_dir, File},
+                io::AsyncReadExt,
+            },
+            toml,
+            types::{
+                self,
+                api::{APIError, CompressedEvent},
+                external::{
+                    chrono::{DateTime, Duration},
+                    serde_json,
+                },
             },
         },
+        plugin::PluginData,
     },
-    plugin::PluginData,
+    std::{path::PathBuf, str::FromStr, sync::Arc},
 };
-use std::str::FromStr;
-use std::{fmt::format, path::PathBuf, sync::Arc};
 
 mod files;
 mod pdf;
@@ -221,15 +212,15 @@ impl server_api::plugin::PluginTrait for Plugin {
                             .ok_or(APIError::Custom(
                                 "Unable to parse filename. Filename is too short".to_string(),
                             ))
-                            .and_then(|v| {
-                                v.parse::<i64>()
+                            .and_then(|d| {
+                                d.parse::<i64>()
                                     .map_err(|v| {
                                         APIError::Custom(format!("Unable to parse filename. Not a valid number inside filename: {}", v))
                                     })
                                     .and_then(|t| {
                                         DateTime::from_timestamp(t, 0)
                                             .ok_or(APIError::Custom("Unable to parse filename. Unable to parse timestamp.".to_string()))
-                                            .map(|t| (f.clone(), v.to_string(), t))
+                                            .map(|t| (f.clone(), v.split('.').take(v.split('.').count()-3).collect::<Vec<_>>().join("."), t))
                                     })
                             })
                     })
@@ -237,7 +228,7 @@ impl server_api::plugin::PluginTrait for Plugin {
             .collect::<Result<Vec<_>, APIError>>()?
             .into_iter()
             .filter_map(|v| {
-                range.includes(&(v.2)).then(||{ 
+                range.includes(&(v.2)).then(||{
                     let path = v.0.to_str().unwrap_or("").to_string(); 
                     CompressedEvent {
                     title: v.1,
@@ -260,6 +251,10 @@ impl server_api::plugin::PluginTrait for Plugin {
     fn rocket_build_access(&self, rocket: Rocket<Build>) -> Rocket<Build> {
         rocket
             .manage(VerifyingKeyWrapper(self.verifying_key.clone()))
+            .mount(
+                "/api/plugin/timeline_plugin_documents/js/",
+                FileServer::from("../plugins/timeline_plugin_documents/server/js/").rank(11),
+            )
     }
 }
 

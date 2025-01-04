@@ -1,24 +1,24 @@
-use std::{
-    collections::HashMap,
-    fs::{FileType, Metadata},
-    io,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::SystemTime,
-};
-
-use pdfium_render::prelude::Pdfium;
-use server_api::external::{
-    futures::{
-        future::{join_all, BoxFuture},
-        FutureExt,
+use {
+    pdfium_render::prelude::Pdfium,
+    server_api::external::{
+        futures::{
+            future::BoxFuture,
+            FutureExt,
+        },
+        tokio::fs::{copy, metadata, read_dir},
+        types::external::chrono,
     },
-    tokio::fs::{copy, metadata, read_dir, File},
-    types::external::chrono,
+    std::{
+        collections::HashMap,
+        fs::{FileType, Metadata},
+        io,
+        path::{Path, PathBuf},
+        sync::Arc,
+    },
 };
 
 use crate::pdf::{
-    get_pdfium, Comparison, PDFComparison, PDFComparisonError, PDFEditor, PDFEditorError,
+    Comparison, PDFComparison, PDFComparisonError, PDFEditor, PDFEditorError,
 };
 
 #[derive(Debug)]
