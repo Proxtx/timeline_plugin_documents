@@ -2,7 +2,7 @@ use {
     pdfium_render::prelude::Pdfium,
     server_api::external::{
         futures::{future::BoxFuture, FutureExt},
-        tokio::fs::{copy, metadata, read_dir},
+        tokio::fs::{copy, metadata, read_dir, create_dir_all},
         types::external::chrono,
     },
     std::{
@@ -130,9 +130,17 @@ impl FileManager {
         let mut res = HashMap::new();
         for (path, result) in updated_pdfs.into_iter() {
             let cres = match result {
-                Ok(diff_path) => match copy(path, associations.get(path).unwrap()).await {
-                    Err(e) => (path, Err(FileManagerError::Io(e))),
-                    Ok(_) => (path, Ok(diff_path)),
+                Ok(diff_path) => {
+                    let target_path = associations.get(path).unwrap();
+                    let res = match target_path.parent() {
+                        Some(parent) => Some(create_dir_all(parent).await),
+                        None => None
+                    };
+                    match (res, copy(path, target_path).await) {
+                        (Some(Err(e)), _) => (path, Err(FileManagerError::Io(e))),
+                        (_, Ok(_)) => (path, Ok(diff_path)),
+                        (_, Err(e)) => (path, Err(FileManagerError::Io(e))),
+                    }
                 },
                 Err(e) => (path, Err(e)),
             };
