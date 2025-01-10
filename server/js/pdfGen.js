@@ -14,7 +14,7 @@ export class PDFGenerator {
             const canvas = document.createElement('canvas');
             container.appendChild(canvas);
             const context = canvas.getContext('2d');
-            const viewport = page.getViewport({ scale: 1 });
+            const viewport = page.getViewport({ scale: 2 });
             canvas.style.width = "100%";
             canvas.width = viewport.width;
             canvas.height = viewport.height;
