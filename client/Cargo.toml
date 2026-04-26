@@ -1,13 +1,23 @@
 [package]
 name = "timeline_plugin_documents_client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
-[lib]
-path = "src/lib.rs"
+[[bin]]
+name = "timeline_plugin_documents_client"
+path = "src/main.rs"
 
 [dependencies]
-client_api = { path = "../../../client_api/" }
-leptos = "0.6.14"
-serde = "1.0.215"
-wasm-bindgen = "0.2.37"
+timeline_plugin_client_sdk = { path = "../../../timeline_plugin_client_sdk" }
+
+leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlDivElement", "Window"] }
+
+[profile.release]
+lto = true
+opt-level = "z"

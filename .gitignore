@@ -29,3 +29,11 @@ server/diff
 server/last
 server/key
 server/key.pub
+
+# Trunk build output
+client/dist/
+
+# Local runtime data + local config + auto-generated key
+data/
+config.toml
+signing_key.pem

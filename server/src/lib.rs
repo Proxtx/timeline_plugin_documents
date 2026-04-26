@@ -1,267 +1,237 @@
-use {
-    crate::types::available_plugins::AvailablePlugins,
-    base64::Engine,
-    files::FileManager,
-    pdf::get_pdfium,
-    rocket::{fs::FileServer, get, http::Status, routes, Build, Rocket, State},
-    rsa::{
-        pkcs1v15::{Signature, SigningKey, VerifyingKey},
-        pkcs8::DecodePrivateKey,
-        sha2::Sha256,
-        signature::{Keypair, RandomizedSigner, SignatureEncoding, Verifier},
-        RsaPrivateKey,
-    },
-    serde::{Deserialize, Serialize},
-    server_api::{
-        external::{
-            futures::{future::join_all, FutureExt},
-            tokio::{
-                fs::{read_dir, File},
-                io::AsyncReadExt,
-            },
-            toml,
-            types::{
-                self,
-                api::{APIError, CompressedEvent},
-                external::{
-                    chrono::{DateTime, Duration},
-                    serde_json,
-                },
-            },
-        },
-        plugin::PluginData,
-    },
-    std::{path::PathBuf, str::FromStr, sync::Arc},
+//! Documents plugin: tracks PDF changes between two parallel directory
+//! trees (current vs last), generates a diff PDF marking which page rows
+//! changed, then exposes the diff as a signed-URL download. Events are
+//! derived from filenames in the diff directory (the timestamp is encoded
+//! in the filename).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine;
+use chrono::DateTime;
+use rocket::fs::{FileServer, NamedFile, Options};
+use rocket::http::Status;
+use rocket::{get, routes, Build, Rocket, Route, State};
+use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use rsa::sha2::Sha256;
+use rsa::signature::{Keypair, RandomizedSigner, SignatureEncoding, Verifier};
+use rsa::RsaPrivateKey;
+use serde::{Deserialize, Serialize};
+use tokio::fs::read_dir;
+
+use timeline_plugin_sdk::auth::AuthedClient;
+use timeline_plugin_sdk::{
+    APIError, APIResult, CompressedEvent, Context, Manifest, Plugin, Style, TimeRange, Timing,
 };
 
 mod files;
 mod pdf;
 
-#[derive(Serialize, Deserialize)]
-struct Location {
-    current_path: PathBuf,
-    last_path: PathBuf,
-    diff_path: PathBuf,
+use crate::files::FileManager;
+use crate::pdf::get_pdfium;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Location {
+    pub current_path: PathBuf,
+    pub last_path: PathBuf,
+    pub diff_path: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ConfigData {
-    locations: Vec<Location>,
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentsConfig {
+    pub locations: Vec<Location>,
+    /// Optional path to libpdfium.so / pdfium dir. Defaults to ./pdfium
+    /// in CWD.
+    #[serde(default)]
+    pub pdfium_path: Option<PathBuf>,
+    /// Optional path to a directory containing pdfjs (`build/pdf.mjs`,
+    /// `build/pdf.worker.mjs`). If set, files are served at
+    /// `/api/plugin/timeline_plugin_documents/js/...` for the client.
+    #[serde(default)]
+    pub pdfjs_path: Option<PathBuf>,
+    /// Where the RSA signing key lives. Auto-generated as PKCS#8 PEM on
+    /// first run. Defaults to `<plugin_root>/signing_key.pem`.
+    #[serde(default)]
+    pub signing_key_path: Option<PathBuf>,
 }
 
-pub struct Plugin {
-    plugin_data: PluginData,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedDocument {
+    pub path: String,
+    pub signature: String,
+}
+
+pub struct DocumentsPlugin {
+    ctx: Context,
+    config: DocumentsConfig,
     file_managers: Arc<Vec<FileManager>>,
     signing_key: SigningKey<Sha256>,
     verifying_key: VerifyingKey<Sha256>,
 }
 
-impl server_api::plugin::PluginTrait for Plugin {
-    fn get_type() -> AvailablePlugins
-    where
-        Self: Sized,
-    {
-        AvailablePlugins::timeline_plugin_documents
-    }
+impl Plugin for DocumentsPlugin {
+    async fn new(ctx: Context) -> anyhow::Result<Self> {
+        let config: DocumentsConfig = ctx
+            .extra
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("plugin config: {}", e))?;
 
-    async fn new(data: server_api::plugin::PluginData) -> Self
-    where
-        Self: Sized,
-    {
-        let config: ConfigData = toml::Value::try_into(
-            data.config
-                .clone()
-                .expect("Failed to init documents plugin! No config was provided!"),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "Unable to init documents plugin! Provided config does not fit the requirements: {}",
-                e
-            )
-        });
-        let mut key = String::new();
-        File::open("../plugins/timeline_plugin_documents/server/key")
-            .await
-            .expect("Documents Plugin: Unable to open encryption key.")
-            .read_to_string(&mut key)
-            .await
-            .expect("Documents Plugin: Unable to read key file to string");
-
-        let signing_key = SigningKey::new(
-            RsaPrivateKey::from_pkcs8_pem(&key)
-                .expect("Documents Plugin: Unable to parse encryption key!"),
-        );
+        let key_path = config
+            .signing_key_path
+            .clone()
+            .unwrap_or_else(|| ctx.config.plugin_root().join("signing_key.pem"));
+        let private_key = load_or_generate_key(&key_path).await?;
+        let signing_key: SigningKey<Sha256> = SigningKey::new(private_key);
         let verifying_key = signing_key.verifying_key();
 
-        let pdfium = Arc::new(get_pdfium());
-
-        let file_managers = config
+        let pdfium = Arc::new(get_pdfium(config.pdfium_path.as_deref()));
+        let file_managers: Vec<FileManager> = config
             .locations
-            .into_iter()
-            .map(|v| FileManager::new(pdfium.clone(), v.current_path, v.last_path, v.diff_path))
+            .iter()
+            .map(|v| {
+                FileManager::new(
+                    pdfium.clone(),
+                    v.current_path.clone(),
+                    v.last_path.clone(),
+                    v.diff_path.clone(),
+                )
+            })
             .collect();
 
-        Plugin {
-            plugin_data: data,
+        Ok(Self {
+            ctx,
+            config,
             file_managers: Arc::new(file_managers),
             signing_key,
             verifying_key,
+        })
+    }
+
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            name: self.ctx.config.name.clone(),
+            display_name: self
+                .ctx
+                .config
+                .display_name
+                .clone()
+                .unwrap_or_else(|| "Documents".into()),
+            style: Style::Acc2,
+            icon: None,
+            web_entry: Some("timeline_plugin_documents_client.js".into()),
         }
     }
 
-    fn request_loop<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn server_api::external::futures::Future<
-                    Output = Option<types::external::chrono::Duration>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        async move {
-            for mngr in self.file_managers.iter() {
-                let res = mngr.update().await;
-                match res {
-                    Ok(v) => {
-                        v.iter().for_each(|v| {
-                            if let Err(e) = v.1 {
-                                self.plugin_data.report_error_string(format!(
-                                    "Was unable to update document: {}. FileManagerError: {}",
-                                    v.0.display(),
-                                    e
-                                ));
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        self.plugin_data
-                            .report_error_string(format!("Unable initialize Document Scan: {}", e));
+    async fn events(&self, range: TimeRange) -> APIResult<Vec<CompressedEvent>> {
+        let mut out = Vec::new();
+        for fm in self.file_managers.iter() {
+            let mut entries = match read_dir(&fm.diff_path).await {
+                Ok(e) => e,
+                Err(e) => {
+                    self.ctx
+                        .errors
+                        .report(format!("read_dir {}: {}", fm.diff_path.display(), e));
+                    continue;
+                }
+            };
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| APIError::Custom(format!("dir entry: {}", e)))?
+            {
+                let path = entry.path();
+                let Some((title, time)) = parse_diff_filename(&path) else {
+                    continue;
+                };
+                if !range.includes(&time) {
+                    continue;
+                }
+                let path_str = path.to_string_lossy().into_owned();
+                let signature = sign_string(&self.signing_key, &path_str);
+                out.push(CompressedEvent {
+                    title,
+                    time: Timing::Instant(time),
+                    data: serde_json::to_value(SignedDocument {
+                        path: path_str,
+                        signature,
+                    })?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn request_loop(&self) -> Option<Duration> {
+        for fm in self.file_managers.iter() {
+            match fm.update().await {
+                Ok(map) => {
+                    for (path, result) in map {
+                        if let Err(e) = result {
+                            self.ctx
+                                .errors
+                                .report(format!("update {}: {}", path.display(), e));
+                        }
                     }
                 }
+                Err(e) => {
+                    self.ctx
+                        .errors
+                        .report(format!("filemanager init: {}", e));
+                }
             }
-            Some(Duration::minutes(1))
         }
-        .boxed()
+        Some(Duration::from_secs(60))
     }
 
-    fn get_compressed_events(
-        &self,
-        query_range: &types::timing::TimeRange,
-    ) -> std::pin::Pin<
-        Box<
-            dyn server_api::external::futures::Future<
-                    Output = types::api::APIResult<Vec<types::api::CompressedEvent>>,
-                > + Send,
-        >,
-    > {
-        let file_managers = self.file_managers.clone();
-        let range = query_range.clone();
-        let singing_key = self.signing_key.clone();
-
-        async move {
-            Ok(join_all(
-                join_all(
-                    file_managers
-                        .iter()
-                        .map(|v| read_dir(&v.diff_path))
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                .into_iter()
-                .map(|v| async move {
-                    match v {
-                        Ok(mut v) => {
-                            let mut res = Vec::new();
-                            while let Some(v) = match v.next_entry().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return Err(APIError::Custom(format!(
-                                        "IO Error unable to read file entry: {}",
-                                        e
-                                    )))
-                                }
-                            } {
-                                res.push(v.path());
-                            }
-                            Ok(res)
-                        }
-                        Err(e) => Err(APIError::Custom(format!(
-                            "Unable to read diff documents. IO Error: {}",
-                            e
-                        ))),
-                    }
-                })
-                .collect::<Vec<_>>(),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, APIError>>()?
-            .into_iter()
-            .flatten()
-            .map(|f| {
-                f.file_name()
-                    .and_then(|v| v.to_str())
-                    .ok_or(APIError::Custom(
-                        "Unable to parse filename: Can't read filename".to_string(),
-                    ))
-                    .and_then(|v| {
-                        v.split('.')
-                            .rev()
-                            .nth(1)
-                            .ok_or(APIError::Custom(
-                                "Unable to parse filename. Filename is too short".to_string(),
-                            ))
-                            .and_then(|d| {
-                                d.parse::<i64>()
-                                    .map_err(|v| {
-                                        APIError::Custom(format!("Unable to parse filename. Not a valid number inside filename: {}", v))
-                                    })
-                                    .and_then(|t| {
-                                        DateTime::from_timestamp(t, 0)
-                                            .ok_or(APIError::Custom("Unable to parse filename. Unable to parse timestamp.".to_string()))
-                                            .map(|t| (f.clone(), v.split('.').take(v.split('.').count()-3).collect::<Vec<_>>().join("."), t))
-                                    })
-                            })
-                    })
-            })
-            .collect::<Result<Vec<_>, APIError>>()?
-            .into_iter()
-            .filter_map(|v| {
-                range.includes(&(v.2)).then(||{
-                    let path = v.0.to_str().unwrap_or("").to_string(); 
-                    CompressedEvent {
-                    title: v.1,
-                    time: types::timing::Timing::Instant(v.2),
-                    data: serde_json::to_value(SignedDocument {
-                        signature: sign_string(&singing_key, &path),
-                        path,
-                    }).unwrap(),
-                }})
-            })
-            .collect())
-        }
-        .boxed()
-    }
-
-    fn get_routes() -> Vec<rocket::Route> {
+    fn routes(&self) -> Vec<Route> {
         routes![get_file]
     }
 
-    fn rocket_build_access(&self, rocket: Rocket<Build>) -> Rocket<Build> {
+    fn rocket_attach(&self, rocket: Rocket<Build>) -> Rocket<Build> {
+        let mut rocket = rocket.manage(VerifyingKeyState(self.verifying_key.clone()));
+        if let Some(pdfjs) = &self.config.pdfjs_path {
+            rocket = rocket.mount(
+                "/js",
+                FileServer::new(pdfjs, Options::Index | Options::DotFiles).rank(11),
+            );
+        }
         rocket
-            .manage(VerifyingKeyWrapper(self.verifying_key.clone()))
-            .mount(
-                "/api/plugin/timeline_plugin_documents/js/",
-                FileServer::from("../plugins/timeline_plugin_documents/server/js/").rank(11),
-            )
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct SignedDocument {
-    path: String,
-    signature: String,
+// ---- routes ----
+
+struct VerifyingKeyState(VerifyingKey<Sha256>);
+
+#[get("/file/<file>/<signature>")]
+async fn get_file(
+    _auth: AuthedClient,
+    file: &str,
+    signature: &str,
+    verifying_key: &State<VerifyingKeyState>,
+) -> Result<NamedFile, Status> {
+    if !verify_string(&verifying_key.inner().0, file, signature) {
+        return Err(Status::Unauthorized);
+    }
+    NamedFile::open(file).await.map_err(|_| Status::NotFound)
+}
+
+// ---- helpers ----
+
+fn parse_diff_filename(path: &Path) -> Option<(String, DateTime<chrono::Utc>)> {
+    // `<title>.diff.<unix_seconds>.pdf`
+    let name = path.file_name()?.to_str()?;
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let ts: i64 = parts[parts.len() - 2].parse().ok()?;
+    let when = DateTime::from_timestamp(ts, 0)?;
+    let title = parts[..parts.len() - 3].join(".");
+    Some((title, when))
 }
 
 fn sign_string(signing_key: &SigningKey<Sha256>, string: &str) -> String {
@@ -271,35 +241,36 @@ fn sign_string(signing_key: &SigningKey<Sha256>, string: &str) -> String {
 }
 
 fn verify_string(verifying_key: &VerifyingKey<Sha256>, string: &str, signature: &str) -> bool {
-    let bytes = match base64::prelude::BASE64_STANDARD.decode(signature) {
-        Ok(v) => v,
-        Err(_e) => return false,
+    let Ok(bytes) = base64::prelude::BASE64_STANDARD.decode(signature) else {
+        return false;
     };
-    let bytes_slice: &[u8] = &bytes;
-    verifying_key
-        .verify(
-            string.as_bytes(),
-            &match Signature::try_from(bytes_slice) {
-                Ok(v) => v,
-                Err(_e) => return false,
-            },
-        )
-        .is_ok()
+    let Ok(sig) = Signature::try_from(bytes.as_slice()) else {
+        return false;
+    };
+    verifying_key.verify(string.as_bytes(), &sig).is_ok()
 }
 
-#[get("/file/<file>/<signature>")]
-async fn get_file(
-    file: &str,
-    signature: &str,
-    verifying_key: &State<VerifyingKeyWrapper>,
-) -> (Status, Option<Result<File, std::io::Error>>) {
-    if !verify_string(&verifying_key.inner().0, file, signature) {
-        return (Status::Unauthorized, None);
+async fn load_or_generate_key(path: &Path) -> anyhow::Result<RsaPrivateKey> {
+    use rand::SeedableRng;
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        let key = RsaPrivateKey::from_pkcs8_pem(&content)
+            .map_err(|e| anyhow::anyhow!("invalid signing key at {:?}: {}", path, e))?;
+        return Ok(key);
     }
-    match PathBuf::from_str(file) {
-        Ok(v) => (Status::Ok, (Some(File::open(v).await))),
-        Err(_) => (Status::BadRequest, None),
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
     }
+    let key = tokio::task::spawn_blocking(|| {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        RsaPrivateKey::new(&mut rng, 2048)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("rsa keygen task: {}", e))?
+    .map_err(|e| anyhow::anyhow!("rsa keygen: {}", e))?;
+    let pem = key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("encode signing key: {}", e))?;
+    tokio::fs::write(path, pem.as_bytes()).await?;
+    tracing::info!(path = %path.display(), "generated new documents signing key");
+    Ok(key)
 }
-
-struct VerifyingKeyWrapper(pub VerifyingKey<Sha256>);

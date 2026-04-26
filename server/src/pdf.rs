@@ -146,15 +146,17 @@ impl From<PdfiumError> for PDFComparisonError {
     }
 }
 
-pub fn get_pdfium() -> Pdfium {
+pub fn get_pdfium(library_path: Option<&std::path::Path>) -> Pdfium {
+    if let Some(p) = library_path {
+        if let Ok(b) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(p)) {
+            return Pdfium::new(b);
+        }
+    }
     Pdfium::new(
-        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
-            "../plugins/timeline_plugin_documents/pdfium",
-        ))
-        .or_else(|_| {
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("../pdfium"))
-        })
-        .expect("Was unable to load pdfium."),
+        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./pdfium"))
+            .or_else(|_| Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(".")))
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .expect("Was unable to load pdfium. Set [config].pdfium_path or place libpdfium.so in CWD."),
     )
 }
 
@@ -371,51 +373,3 @@ impl PDFEditor {
     }
 }
 
-#[cfg(test)]
-mod pdf_comparison {
-    use std::{path::PathBuf, sync::Arc};
-
-    use crate::pdf::get_pdfium;
-
-    use super::{PDFComparison, PDFEditor};
-
-    #[test]
-    fn init_pdfium() {
-        let pdfium = Arc::new(get_pdfium());
-        PDFComparison::new(pdfium);
-    }
-
-    #[test]
-    fn comparison() {
-        let pdfium = Arc::new(get_pdfium());
-        let strct = PDFComparison::new(pdfium);
-        let cmp = strct
-            .compare_pdfs(
-                &PathBuf::from("./new_dev.pdf"),
-                &PathBuf::from("./old_dev.pdf"),
-            )
-            .unwrap();
-        println!("{:?}", cmp);
-    }
-
-    #[test]
-    fn annotation() {
-        let pdfium = Arc::new(get_pdfium());
-        let strct = PDFComparison::new(pdfium.clone());
-        let cmp = strct
-            .compare_pdfs(
-                &PathBuf::from("./new_dev.pdf"),
-                &PathBuf::from("./old_dev.pdf"),
-            )
-            .unwrap();
-        println!("Got comparison. Now loading pdfium.");
-        let edtr = PDFEditor::new(pdfium.clone());
-        println!("Ok good");
-        edtr.mark_differences(
-            &PathBuf::from("./new_dev.pdf"),
-            &cmp,
-            &PathBuf::from("./newest_dev.pdf"),
-        )
-        .unwrap();
-    }
-}

@@ -1,0 +1,23 @@
+[plugin]
+name = "timeline_plugin_documents"
+port = 9011
+token = "change-me"
+
+[config]
+# Optional: path to libpdfium.so (or directory containing it).
+# Defaults to ./pdfium relative to CWD.
+# pdfium_path = "/path/to/pdfium"
+
+# Optional: path to the pdfjs distribution (with build/pdf.mjs etc.).
+# When set, files are served at /api/plugin/timeline_plugin_documents/js/...
+# pdfjs_path = "/path/to/pdfjs"
+
+# Optional: where to keep the RSA signing key. Defaults to
+# <data_dir>/plugins/timeline_plugin_documents/signing_key.pem.
+# signing_key_path = "/path/to/signing_key.pem"
+
+# At least one location is required.
+[[config.locations]]
+current_path = "/var/www/webdav/GoodNotes/"
+last_path    = "/var/www/webdav/GoodNotes_Last/"
+diff_path    = "/var/www/webdav/GoodNotes_Diff/"
