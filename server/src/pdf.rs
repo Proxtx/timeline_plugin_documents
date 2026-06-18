@@ -15,38 +15,30 @@ pub enum Comparison {
     Different(DifferenceSegments),
 }
 
-impl Comparison {
-    pub fn from_similarity(sim: &PageSimilarity, img_a: &RgbImage, img_b: &[RgbImage]) -> Self {
-        match sim {
-            PageSimilarity::Different => Comparison::Different(DifferenceSegments {
-                segments: vec![(0., 1.)],
-            }),
-            PageSimilarity::Similar(index, sim) => {
-                if *sim == 0 {
-                    Comparison::Identical
-                } else {
-                    let img_b = img_b.get(*index).unwrap();
-                    let num_rows = img_a.rows().len();
-                    let mut difference_builder = DifferenceSegementsBuilder::build();
-                    img_a
-                        .rows()
-                        .zip(img_b.rows())
-                        .enumerate()
-                        .for_each(|(index, (r_a, r_b))| {
-                            let mut equal = true;
-                            for (p_a, p_b) in r_a.zip(r_b) {
-                                if p_a != p_b {
-                                    equal = false;
-                                    break;
-                                }
-                            }
-                            difference_builder.step(index as f64 / (num_rows - 1) as f64, !equal);
-                        });
-                    Comparison::Different(difference_builder.finish())
+/// Build per-row difference segments between two equally-sized page renders.
+fn row_diff(img_a: &RgbImage, img_b: &RgbImage) -> DifferenceSegments {
+    let num_rows = img_a.rows().len();
+    if num_rows <= 1 {
+        return DifferenceSegments {
+            segments: vec![(0., 1.)],
+        };
+    }
+    let mut difference_builder = DifferenceSegementsBuilder::build();
+    img_a
+        .rows()
+        .zip(img_b.rows())
+        .enumerate()
+        .for_each(|(index, (r_a, r_b))| {
+            let mut equal = true;
+            for (p_a, p_b) in r_a.zip(r_b) {
+                if p_a != p_b {
+                    equal = false;
+                    break;
                 }
             }
-        }
-    }
+            difference_builder.step(index as f64 / (num_rows - 1) as f64, !equal);
+        });
+    difference_builder.finish()
 }
 
 struct DifferenceSegementsBuilder {
@@ -116,12 +108,6 @@ impl Similiarity {
 }
 
 #[derive(Debug)]
-pub enum PageSimilarity {
-    Different,
-    Similar(usize, usize),
-}
-
-#[derive(Debug)]
 pub enum PDFComparisonError {
     UnableToLoadPDF(PdfiumError),
     UnableToRenderPDF(PdfiumError),
@@ -162,18 +148,26 @@ pub fn get_pdfium(library_path: Option<&std::path::Path>) -> Pdfium {
 
 pub struct PDFComparison {
     pdfium: Arc<Pdfium>,
+    render_config: PdfRenderConfig,
 }
 
 impl PDFComparison {
     pub fn new(pdfium: Arc<Pdfium>) -> Self {
-        PDFComparison { pdfium }
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(500)
+            .set_maximum_height(10000)
+            .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true);
+        PDFComparison {
+            pdfium,
+            render_config,
+        }
     }
 
     pub fn compare_pdfs(&self, a: &Path, b: &Path) -> Result<Vec<Comparison>, PDFComparisonError> {
         let pdf_a = self.pdfium.load_pdf_from_file(a, None);
         let pdf_b = self.pdfium.load_pdf_from_file(b, None);
         let (pdf_a, pdf_b) = match (pdf_a, pdf_b) {
-            (Ok(pdf_a), Ok(pdf_b)) => (Arc::new(pdf_a), Arc::new(pdf_b)),
+            (Ok(pdf_a), Ok(pdf_b)) => (pdf_a, pdf_b),
             (Ok(pdf_a), Err(_e)) => {
                 return Ok((0..pdf_a.pages().len())
                     .map(|_| {
@@ -186,54 +180,63 @@ impl PDFComparison {
             (Err(e), _) => return Err(PDFComparisonError::UnableToLoadPDF(e)),
         };
 
-        let images = (self.extract_images(pdf_a), self.extract_images(pdf_b));
-
-        let (images_a, images_b) = match images {
-            (Ok(images_a), Ok(images_b)) => (images_a, images_b),
-            (Err(e), _) | (_, Err(e)) => return Err(e),
-        };
-
-        let page_similarities = PDFComparison::find_min_similarity_for_images(&images_a, &images_b);
-
-        Ok(page_similarities
-            .par_iter()
-            .enumerate()
-            .map(|(index, sim)| {
-                Comparison::from_similarity(sim, images_a.get(index).unwrap(), &images_b)
+        let n_b = pdf_b.pages().len();
+        // Render pages on demand, one at a time, comparing page A[i] against
+        // pdf_b. Peak memory is ~two page bitmaps regardless of document length
+        // — rendering every page up-front (the previous approach) OOM-killed the
+        // process on memory-constrained hosts. Slower (up to O(n*m) renders) but
+        // safe; the same-index fast path keeps the common "unchanged page" case
+        // at ~2 renders/page.
+        (0..pdf_a.pages().len())
+            .map(|i| {
+                let img_a = self.render_page(&pdf_a, i)?;
+                self.compare_page(&img_a, &pdf_b, n_b, i)
             })
-            .collect())
-    }
-
-    fn find_min_similarity_for_images(
-        img_a: &Vec<RgbImage>,
-        img_b: &Vec<RgbImage>,
-    ) -> Vec<PageSimilarity> {
-        img_a
-            .par_iter()
-            .map(|a| PDFComparison::find_min_similarity(a, img_b))
             .collect()
     }
 
-    fn find_min_similarity(img_a: &RgbImage, img_b: &Vec<RgbImage>) -> PageSimilarity {
-        match img_b
-            .par_iter()
-            .enumerate()
-            .map(|(i, v)| (i, PDFComparison::compare_images(img_a, v)))
-            .min_by(|a, b| a.1.cmp(&b.1))
-        {
-            Some((i, sim)) => match sim {
-                Similiarity::Similar(sim) => PageSimilarity::Similar(i, sim),
-                Similiarity::Different => PageSimilarity::Different,
-            },
-            None => PageSimilarity::Different,
+    /// Classify page `img_a` against pdf_b, rendering B pages on demand.
+    fn compare_page(
+        &self,
+        img_a: &RgbImage,
+        pdf_b: &PdfDocument,
+        n_b: u16,
+        same_index: u16,
+    ) -> Result<Comparison, PDFComparisonError> {
+        // Fast path: an identical page at the same index needs no full scan.
+        if same_index < n_b {
+            let img_b = self.render_page(pdf_b, same_index)?;
+            if let Similiarity::Similar(0) = PDFComparison::compare_images(img_a, &img_b) {
+                return Ok(Comparison::Identical);
+            }
+        }
+        // Otherwise find the most-similar B page (handles inserted/moved pages).
+        let mut best: Option<(u16, usize)> = None;
+        for j in 0..n_b {
+            let img_b = self.render_page(pdf_b, j)?;
+            if let Similiarity::Similar(c) = PDFComparison::compare_images(img_a, &img_b) {
+                if best.map_or(true, |(_, bc)| c < bc) {
+                    best = Some((j, c));
+                }
+            }
+        }
+        match best {
+            None => Ok(Comparison::Different(DifferenceSegments {
+                segments: vec![(0., 1.)],
+            })),
+            Some((_, 0)) => Ok(Comparison::Identical),
+            Some((j, _)) => {
+                let img_b = self.render_page(pdf_b, j)?;
+                Ok(Comparison::Different(row_diff(img_a, &img_b)))
+            }
         }
     }
 
     fn compare_images(img_a: &RgbImage, img_b: &RgbImage) -> Similiarity {
-        let similarity = AtomicUsize::new(0);
         if img_a.dimensions() != img_b.dimensions() {
             return Similiarity::Different;
         }
+        let similarity = AtomicUsize::new(0);
         (0..img_a.dimensions().0).into_par_iter().for_each(|x| {
             (0..img_a.dimensions().1).into_par_iter().for_each(|y| {
                 if img_a.get_pixel(x, y) != img_b.get_pixel(x, y) {
@@ -244,20 +247,11 @@ impl PDFComparison {
         Similiarity::Similar(similarity.into_inner())
     }
 
-    fn extract_images(&self, pdf: Arc<PdfDocument>) -> Result<Vec<RgbImage>, PDFComparisonError> {
-        let render_config = PdfRenderConfig::new()
-            .set_target_width(500)
-            .set_maximum_height(10000)
-            .rotate_if_landscape(PdfPageRenderRotation::Degrees90, true);
-
-        (0..pdf.pages().len())
-            .map(
-                |p_index| match pdf.pages().get(p_index)?.render_with_config(&render_config) {
-                    Ok(bitmap) => Ok(bitmap.as_image().into_rgb8()),
-                    Err(e) => Err(PDFComparisonError::UnableToRenderPDF(e)),
-                },
-            )
-            .collect()
+    fn render_page(&self, pdf: &PdfDocument, index: u16) -> Result<RgbImage, PDFComparisonError> {
+        match pdf.pages().get(index)?.render_with_config(&self.render_config) {
+            Ok(bitmap) => Ok(bitmap.as_image().into_rgb8()),
+            Err(e) => Err(PDFComparisonError::UnableToRenderPDF(e)),
+        }
     }
 }
 
